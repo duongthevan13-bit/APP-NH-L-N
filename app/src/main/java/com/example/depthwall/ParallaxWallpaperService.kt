@@ -12,6 +12,7 @@ import android.os.Handler
 import android.os.Looper
 import android.service.wallpaper.WallpaperService
 import android.view.SurfaceHolder
+import android.widget.Toast
 import java.io.File
 import kotlin.math.max
 import kotlin.math.sqrt
@@ -49,10 +50,18 @@ class ParallaxWallpaperService : WallpaperService() {
         private var mediaPlayer: MediaPlayer? = null
         private var videoMode = false
         private var videoCompleted = false
+        private var videoFailed = false
+        private var renderingStarted = false
+        private var capturing = false
+        private var currentVideo: File? = null
         private var lastFrame: Bitmap? = null
         private var videoStamp = 0L
 
         private fun isFrozen(): Boolean = videoMode && videoCompleted && lastFrame != null
+
+        private fun toast(msg: String) {
+            try { Toast.makeText(applicationContext, msg, Toast.LENGTH_LONG).show() } catch (e: Exception) {}
+        }
 
         private val frame = object : Runnable {
             override fun run() {
@@ -61,6 +70,21 @@ class ParallaxWallpaperService : WallpaperService() {
                 drawFrame()
                 handler.postDelayed(this, 16L)
             }
+        }
+
+        // Neu sau 4 giay video chua hien hinh -> dung khung hinh cuoi
+        private val watchdog = Runnable {
+            val f = currentVideo
+            if (mediaPlayer != null && !renderingStarted && !videoCompleted && f != null) {
+                toast("Video không hiển thị được, dùng khung hình cuối")
+                videoCompleted = true
+                captureLastFrame(f)
+            }
+        }
+
+        private fun scheduleWatchdog() {
+            handler.removeCallbacks(watchdog)
+            if (!renderingStarted) handler.postDelayed(watchdog, 4000L)
         }
 
         private fun startLoop() {
@@ -81,6 +105,7 @@ class ParallaxWallpaperService : WallpaperService() {
         }
 
         override fun onSurfaceDestroyed(holder: SurfaceHolder) {
+            handler.removeCallbacks(watchdog)
             stopVideo()
             super.onSurfaceDestroyed(holder)
         }
@@ -101,6 +126,7 @@ class ParallaxWallpaperService : WallpaperService() {
         override fun onDestroy() {
             sm.unregisterListener(this)
             handler.removeCallbacks(frame)
+            handler.removeCallbacks(watchdog)
             stopVideo()
             bg?.recycle(); bg = null
             fg?.recycle(); fg = null
@@ -121,65 +147,92 @@ class ParallaxWallpaperService : WallpaperService() {
                 if (video.lastModified() != videoStamp) {
                     videoStamp = video.lastModified()
                     videoCompleted = false
+                    videoFailed = false
+                    capturing = false
+                    handler.removeCallbacks(watchdog)
                     lastFrame?.recycle(); lastFrame = null
                     stopVideo()
                 }
-                videoMode = true
-                handler.removeCallbacks(frame)
-                if (isFrozen()) {
-                    startLoop()
+                if (!videoFailed) {
+                    videoMode = true
+                    handler.removeCallbacks(frame)
+                    if (videoCompleted) {
+                        if (isFrozen()) startLoop()
+                        return
+                    }
+                    startVideo(holder, video)
                     return
                 }
-                startVideo(holder, video)
-            } else {
-                videoMode = false
-                videoCompleted = false
-                lastFrame?.recycle(); lastFrame = null
-                stopVideo()
-                loadImages()
-                startLoop()
             }
+            videoMode = false
+            videoCompleted = false
+            lastFrame?.recycle(); lastFrame = null
+            stopVideo()
+            loadImages()
+            startLoop()
         }
 
         private fun startVideo(holder: SurfaceHolder, file: File) {
+            currentVideo = file
             if (mediaPlayer != null) {
-                if (visible && !videoCompleted) mediaPlayer?.startSafely()
+                if (visible && !videoCompleted) {
+                    mediaPlayer?.startSafely()
+                    scheduleWatchdog()
+                }
                 return
             }
             try {
                 val player = MediaPlayer()
                 mediaPlayer = player
+                renderingStarted = false
+                videoCompleted = false
                 player.setDataSource(file.absolutePath)
                 player.setSurface(holder.surface)
                 player.isLooping = false
                 player.setVolume(0f, 0f)
-                videoCompleted = false
+                player.setOnInfoListener { _, what, _ ->
+                    if (what == MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) {
+                        renderingStarted = true
+                        handler.removeCallbacks(watchdog)
+                    }
+                    false
+                }
                 player.setOnPreparedListener { mp ->
                     mp.isLooping = false
                     try {
                         mp.setVideoScalingMode(MediaPlayer.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)
                     } catch (e: Exception) {}
-                    if (visible && !videoCompleted) mp.startSafely()
+                    if (visible && !videoCompleted) {
+                        mp.startSafely()
+                        scheduleWatchdog()
+                    }
                 }
                 player.setOnCompletionListener {
+                    handler.removeCallbacks(watchdog)
                     videoCompleted = true
                     captureLastFrame(file)
                 }
-                player.setOnErrorListener { _, _, _ ->
+                player.setOnErrorListener { _, what, extra ->
+                    handler.removeCallbacks(watchdog)
+                    toast("Lỗi phát video ($what/$extra), dùng khung hình cuối")
                     stopVideo()
-                    videoMode = false
-                    startLoop()
+                    videoCompleted = true
+                    captureLastFrame(file)
                     true
                 }
                 player.prepareAsync()
             } catch (e: Exception) {
+                toast("Không mở được video: ${e.message}")
                 stopVideo()
-                videoMode = false
-                startLoop()
+                videoCompleted = true
+                captureLastFrame(file)
             }
         }
 
+        // Lay khung hinh cuoi thanh anh tinh, tat trinh phat video, bat hieu ung 3D
         private fun captureLastFrame(file: File) {
+            if (capturing) return
+            capturing = true
             Thread {
                 var bmp: Bitmap? = null
                 val r = MediaMetadataRetriever()
@@ -189,7 +242,8 @@ class ParallaxWallpaperService : WallpaperService() {
                     val times = longArrayOf(
                         dur * 1000L,
                         (dur - 100L).coerceAtLeast(0L) * 1000L,
-                        (dur - 300L).coerceAtLeast(0L) * 1000L
+                        (dur - 300L).coerceAtLeast(0L) * 1000L,
+                        0L
                     )
                     for (t in times) {
                         bmp = r.getFrameAtTime(t, MediaMetadataRetriever.OPTION_CLOSEST)
@@ -201,11 +255,22 @@ class ParallaxWallpaperService : WallpaperService() {
                 }
                 val result = bmp
                 handler.post {
-                    if (result != null && videoCompleted && mediaPlayer != null) {
-                        lastFrame?.recycle()
-                        lastFrame = result
-                        stopVideo()
-                        startLoop()
+                    capturing = false
+                    if (videoMode) {
+                        if (result != null) {
+                            lastFrame?.recycle()
+                            lastFrame = result
+                            stopVideo()
+                            videoCompleted = true
+                            startLoop()
+                        } else {
+                            toast("Không đọc được video. Hãy thử video MP4 H.264")
+                            stopVideo()
+                            videoFailed = true
+                            videoMode = false
+                            videoCompleted = false
+                            startLoop()
+                        }
                     }
                 }
             }.start()
@@ -214,7 +279,13 @@ class ParallaxWallpaperService : WallpaperService() {
         private fun stopVideo() {
             val p = mediaPlayer
             mediaPlayer = null
-            try { p?.setOnPreparedListener(null); p?.setOnErrorListener(null); p?.setOnCompletionListener(null); p?.stop() } catch (e: Exception) {}
+            try {
+                p?.setOnPreparedListener(null)
+                p?.setOnErrorListener(null)
+                p?.setOnCompletionListener(null)
+                p?.setOnInfoListener(null)
+                p?.stop()
+            } catch (e: Exception) {}
             try { p?.reset(); p?.release() } catch (e: Exception) {}
         }
 
